@@ -160,6 +160,26 @@ npm test
 
 ---
 
+## 🔧 Troubleshooting & Diagnostics
+
+If your Stream Deck buttons display "OFFLINE" while Antigravity is running:
+
+1. **Run the built-in diagnostic tool:**
+   ```bash
+   npm run diagnose
+   ```
+   This will scan your system for Antigravity processes, check open TCP ports, attempt the local RPC handshake, and output a detailed step-by-step trace (saving raw API responses to `diagnose-output.json`).
+
+2. **Check Stream Deck Plugin Logs:**
+   The plugin writes real-time probe logs to:
+   - **Windows**: `%APPDATA%\Elgato\StreamDeck\Plugins\com.mjwitz.gemini-tracker.sdPlugin\logs`
+   - **macOS**: `~/Library/Application Support/com.elgato.StreamDeck/Plugins/com.mjwitz.gemini-tracker.sdPlugin/logs`
+
+3. **Verify Demo Mode:**
+   Click any key on your Stream Deck canvas, open the **Property Inspector**, and set **Data Source** to **Demo Mode**. If the gauge immediately lights up with sample data, your Stream Deck and plugin rendering pipeline are working properly!
+
+---
+
 ## 📄 License
 
 MIT License. Designed for the Google Antigravity developer community.

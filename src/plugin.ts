@@ -6,9 +6,12 @@ import { ClaudeGptAction } from "./actions/claude-gpt-action.js";
 import { GeminiArgonAction } from "./actions/gemini-argon-action.js";
 import { MultiMetricCycleAction } from "./actions/cycle-action.js";
 
+import { QuotaService } from "./services/quota-service.js";
+
 // Enable info logging for diagnostics
 streamDeck.logger.setLevel("info");
 streamDeck.logger.info("Initializing Antigravity AI Tracker Stream Deck Plugin...");
+QuotaService.getInstance().setLogger(streamDeck.logger);
 
 // Register all actions requested by user:
 // 1. Weekly Limit

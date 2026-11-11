@@ -8,7 +8,8 @@
     "watch": "rollup -c -w --watch.onEnd=\"streamdeck restart com.mjwitz.gemini-tracker\"",
     "validate": "streamdeck validate com.mjwitz.gemini-tracker.sdPlugin",
     "pack": "streamdeck pack com.mjwitz.gemini-tracker.sdPlugin --output dist --force",
-    "test": "tsx test/plugin.test.ts"
+    "test": "tsx test/plugin.test.ts",
+    "diagnose": "tsx scripts/diagnose.ts"
   },
   "repository": {
     "type": "git",

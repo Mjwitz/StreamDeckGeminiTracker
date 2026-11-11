@@ -1,16 +1,47 @@
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
+import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { AntigravityQuotaSnapshot, QuotaBucket, PluginSettings } from "../types.js";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+const RPC_PREFIX = "/exa.language_server_pb.LanguageServerService/";
+const SUMMARY_METHOD = "RetrieveUserQuotaSummary";
+const STATUS_METHOD = "GetUserStatus";
+
+/** Minimal logger interface (compatible with streamDeck.logger and console). */
+export interface QuotaLogger {
+  info(...args: unknown[]): void;
+  warn(...args: unknown[]): void;
+  error(...args: unknown[]): void;
+  debug?(...args: unknown[]): void;
+}
+
+export interface DetectedProcess {
+  pid: number;
+  name: string;
+  commandLine: string;
+  csrfToken: string;
+  extensionCsrfToken: string;
+  argPorts: number[];
+}
 
 interface LocalProbeTarget {
+  host: string;
   port: number;
-  csrfToken: string;
+  tokens: string[];
 }
+
+interface HttpResult {
+  status: number;
+  body: string;
+}
+
+type Slot = "gemini5h" | "geminiWeekly" | "claude5h" | "claudeWeekly" | "geminiArgonWeekly";
 
 export class QuotaService {
   private static instance: QuotaService;
@@ -18,12 +49,37 @@ export class QuotaService {
   private inFlightPromise: Promise<AntigravityQuotaSnapshot> | null = null;
   private lastFetchTime = 0;
   private cacheTtlMs = 15000; // 15-second minimum cache across multiple keys
+  private logger: QuotaLogger | null = null;
+  private lastGoodTarget: { scheme: "https" | "http"; host: string; port: number; token: string; method: string } | null = null;
+
+  /** Human-readable trace of the most recent fetch (tokens redacted). */
+  public lastDiagnostics: string[] = [];
+  /** Raw JSON body of the last successful local/cloud response. */
+  public lastRawResponse: unknown = null;
 
   public static getInstance(): QuotaService {
     if (!QuotaService.instance) {
       QuotaService.instance = new QuotaService();
     }
     return QuotaService.instance;
+  }
+
+  public setLogger(logger: QuotaLogger | null): void {
+    this.logger = logger;
+  }
+
+  private diag(message: string): void {
+    this.lastDiagnostics.push(message);
+    try {
+      this.logger?.info(`[quota] ${message}`);
+    } catch {
+      // ignore logger failures
+    }
+  }
+
+  private static redact(token: string): string {
+    if (!token) return "(none)";
+    return token.length <= 4 ? "****" : `${token.slice(0, 4)}…`;
   }
 
   /**
@@ -39,8 +95,15 @@ export class QuotaService {
       return this.inFlightPromise;
     }
 
+    this.lastDiagnostics = [];
     this.inFlightPromise = this.fetchInternal(settings)
       .then((snapshot) => {
+        // Don't let a transient offline result wipe out recent good data
+        if (snapshot.source === "offline" && this.cachedSnapshot && this.cachedSnapshot.source !== "offline"
+          && Date.now() - this.cachedSnapshot.lastUpdated < 5 * 60 * 1000) {
+          this.inFlightPromise = null;
+          return this.cachedSnapshot;
+        }
         this.cachedSnapshot = snapshot;
         this.lastFetchTime = Date.now();
         this.inFlightPromise = null;
@@ -48,6 +111,7 @@ export class QuotaService {
       })
       .catch((err) => {
         this.inFlightPromise = null;
+        this.diag(`Unexpected error: ${String(err?.message || err)}`);
         const fallback = this.cachedSnapshot || this.createOfflineSnapshot(String(err?.message || err));
         return fallback;
       });
@@ -71,8 +135,8 @@ export class QuotaService {
     try {
       const localResult = await this.probeLocalLanguageServer(settings.manualPort);
       if (localResult) return localResult;
-    } catch {
-      // Fall through to file-based credentials or offline
+    } catch (err: any) {
+      this.diag(`Local probe failed: ${String(err?.message || err)}`);
     }
 
     // Try finding cached credentials from ~/.gemini
@@ -87,7 +151,7 @@ export class QuotaService {
     }
 
     // If manual auth token is provided
-    if (settings.authToken) {
+    if (settings.authToken && dataSource !== "cloud") {
       const cloudResult = await this.fetchFromCloudCode(settings.authToken.trim());
       if (cloudResult) return cloudResult;
     }
@@ -99,127 +163,301 @@ export class QuotaService {
    * Probes local Antigravity Language Server
    */
   private async probeLocalLanguageServer(manualPort?: string | number): Promise<AntigravityQuotaSnapshot | null> {
+    // Fast path: reuse the last endpoint that worked
+    if (this.lastGoodTarget) {
+      const t = this.lastGoodTarget;
+      const snap = await this.tryEndpoint(t.scheme, t.host, t.port, t.token, t.method);
+      if (snap) return snap;
+      this.diag("Previously working endpoint no longer responds; rediscovering");
+      this.lastGoodTarget = null;
+    }
+
+    const processes = await this.detectLocalProcesses();
+    this.diag(`Found ${processes.length} candidate Antigravity process(es)`);
+    for (const p of processes) {
+      this.diag(`  pid=${p.pid} name=${p.name} csrf=${QuotaService.redact(p.csrfToken)} extCsrf=${QuotaService.redact(p.extensionCsrfToken)} argPorts=[${p.argPorts.join(",")}]`);
+    }
+
+    const allTokens = Array.from(new Set(
+      processes.flatMap((p) => [p.csrfToken, p.extensionCsrfToken]).filter(Boolean)
+    ));
+
     const targets: LocalProbeTarget[] = [];
+    const seen = new Set<string>();
+    const addTarget = (host: string, port: number, tokens: string[]) => {
+      if (!port || port <= 0 || port > 65535) return;
+      const key = `${host}:${port}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      targets.push({ host, port, tokens: Array.from(new Set([...tokens, ""])) });
+    };
 
     if (manualPort) {
       const p = parseInt(String(manualPort), 10);
-      if (!isNaN(p)) {
-        targets.push({ port: p, csrfToken: "" });
-      }
+      if (!isNaN(p)) addTarget("127.0.0.1", p, allTokens);
     }
 
-    // Discover process parameters
-    try {
-      const detected = await this.detectLocalProcesses();
-      for (const d of detected) {
-        targets.push(d);
-      }
-    } catch {
-      // continue
-    }
-
-    for (const target of targets) {
-      // Try RetrieveUserQuotaSummary
-      const snapshot = await this.queryLocalEndpoint(target.port, target.csrfToken);
-      if (snapshot) {
-        return snapshot;
-      }
-    }
-
-    return null;
-  }
-
-  private async detectLocalProcesses(): Promise<LocalProbeTarget[]> {
-    const isWin = process.platform === "win32";
-    const targets: LocalProbeTarget[] = [];
-
-    let cmdOutput = "";
-    try {
-      if (isWin) {
-        // Windows: query powershell for commandline of language_server or agy
-        const { stdout } = await execAsync(
-          `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*language_server*' -or $_.Name -like '*agy*' } | Select-Object -ExpandProperty CommandLine"`,
-          { timeout: 4000 }
-        );
-        cmdOutput = stdout;
-      } else {
-        // Linux / macOS
-        const { stdout } = await execAsync(`ps -eo pid,args | grep -E "language_server|agy" | grep -v grep`, {
-          timeout: 4000
-        });
-        cmdOutput = stdout;
-      }
-    } catch {
-      return targets;
-    }
-
-    const lines = cmdOutput.split(/\r?\n/);
-    for (const line of lines) {
-      if (!line) continue;
-
-      // Extract CSRF token
-      let csrfToken = "";
-      const csrfMatch = line.match(/(?:--csrf_token|-csrf_token)[=\s]+([a-zA-Z0-9_-]+)/);
-      if (csrfMatch) {
-        csrfToken = csrfMatch[1];
-      }
-
-      // Extract extension server port
-      let port = 0;
-      const portMatch = line.match(/(?:--extension_server_port|-extension_server_port)[=\s]+(\d+)/);
-      if (portMatch) {
-        port = parseInt(portMatch[1], 10);
-      }
-
-      if (port > 0) {
-        targets.push({ port, csrfToken });
-        // Many language server instances expose Connect RPC on port, port + 1, or port - 1
-        targets.push({ port: port + 1, csrfToken });
-        targets.push({ port: port - 1, csrfToken });
-      }
-    }
-
-    return targets;
-  }
-
-  private async queryLocalEndpoint(port: number, csrfToken: string): Promise<AntigravityQuotaSnapshot | null> {
-    const endpoints = [
-      `http://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`,
-      `http://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/GetUserStatus`
-    ];
-
-    for (const url of endpoints) {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 2000);
-
-        const headers: Record<string, string> = {
-          "Content-Type": "application/json",
-          "Connect-Protocol-Version": "1"
-        };
-        if (csrfToken) {
-          headers["X-Codeium-Csrf-Token"] = csrfToken;
+    if (processes.length > 0) {
+      const listening = await this.listListeningPorts(processes.map((p) => p.pid));
+      for (const p of processes) {
+        const tokens = [p.csrfToken, p.extensionCsrfToken].filter(Boolean);
+        for (const l of listening.filter((x) => x.pid === p.pid)) {
+          addTarget(l.host, l.port, tokens);
         }
+        for (const port of p.argPorts) {
+          addTarget("127.0.0.1", port, tokens);
+        }
+      }
+    }
 
-        const resp = await fetch(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({}),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
+    this.diag(`Probing ${targets.length} port(s): ${targets.map((t) => `${t.host}:${t.port}`).join(", ") || "(none)"}`);
+    if (targets.length === 0) return null;
 
-        if (!resp.ok) continue;
-
-        const json = await resp.json();
-        const parsed = this.parseQuotaResponse(json, "local");
-        if (parsed) return parsed;
-      } catch {
-        // try next endpoint
+    for (const method of [SUMMARY_METHOD, STATUS_METHOD]) {
+      for (const target of targets) {
+        const snap = await this.probeTarget(target, method);
+        if (snap) return snap;
       }
     }
 
     return null;
+  }
+
+  private async probeTarget(target: LocalProbeTarget, method: string): Promise<AntigravityQuotaSnapshot | null> {
+    for (const scheme of ["https", "http"] as const) {
+      for (const token of target.tokens) {
+        let result: HttpResult;
+        try {
+          result = await this.httpPost(scheme, target.host, target.port, RPC_PREFIX + method, "{}", this.localHeaders(token));
+        } catch (err: any) {
+          this.diag(`  ${scheme}://${target.host}:${target.port} ${method} -> ${err?.code || err?.message || err}`);
+          break; // transport failure: other tokens won't help on this scheme
+        }
+        this.diag(`  ${scheme}://${target.host}:${target.port} ${method} token=${QuotaService.redact(token)} -> HTTP ${result.status} (${result.body.length} bytes)`);
+        if (result.status === 401 || result.status === 403) continue; // try next token
+        if (result.status !== 200) break;
+
+        const snap = this.parseBody(result.body, "local");
+        if (snap) {
+          this.lastGoodTarget = { scheme, host: target.host, port: target.port, token, method };
+          this.diag(`  ✔ Parsed quota from ${scheme}://${target.host}:${target.port}/${method}`);
+          return snap;
+        }
+        this.diag("  Response contained no recognizable quota buckets");
+        break;
+      }
+    }
+    return null;
+  }
+
+  private async tryEndpoint(scheme: "https" | "http", host: string, port: number, token: string, method: string): Promise<AntigravityQuotaSnapshot | null> {
+    try {
+      const r = await this.httpPost(scheme, host, port, RPC_PREFIX + method, "{}", this.localHeaders(token));
+      if (r.status !== 200) return null;
+      return this.parseBody(r.body, "local");
+    } catch {
+      return null;
+    }
+  }
+
+  private localHeaders(token: string): Record<string, string> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Connect-Protocol-Version": "1"
+    };
+    if (token) headers["X-Codeium-Csrf-Token"] = token;
+    return headers;
+  }
+
+  private parseBody(body: string, source: "local" | "cloud"): AntigravityQuotaSnapshot | null {
+    let json: unknown;
+    try {
+      json = JSON.parse(body);
+    } catch {
+      return null;
+    }
+    const snap = this.parseQuotaResponse(json, source);
+    if (snap) this.lastRawResponse = json;
+    return snap;
+  }
+
+  /**
+   * Minimal HTTP(S) POST. Self-signed certificates are accepted because the
+   * Antigravity language server only listens on loopback with its own cert.
+   */
+  private httpPost(
+    scheme: "https" | "http",
+    host: string,
+    port: number,
+    urlPath: string,
+    body: string,
+    headers: Record<string, string>,
+    timeoutMs = 2500
+  ): Promise<HttpResult> {
+    return new Promise((resolve, reject) => {
+      const isLoopback = host === "127.0.0.1" || host === "::1" || host === "localhost";
+      const options: https.RequestOptions = {
+        host,
+        port,
+        path: urlPath,
+        method: "POST",
+        headers: { ...headers, "Content-Length": Buffer.byteLength(body).toString() },
+        timeout: timeoutMs,
+        agent: false
+      };
+      if (scheme === "https" && isLoopback) {
+        options.rejectUnauthorized = false;
+      }
+      const lib = scheme === "https" ? https : http;
+      const req = lib.request(options, (res) => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        res.on("data", (c: Buffer) => {
+          size += c.length;
+          if (size > 2 * 1024 * 1024) {
+            req.destroy(new Error("Response too large"));
+            return;
+          }
+          chunks.push(c);
+        });
+        res.on("end", () => resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks).toString("utf-8") }));
+        res.on("error", reject);
+      });
+      req.on("timeout", () => req.destroy(Object.assign(new Error("timeout"), { code: "ETIMEDOUT" })));
+      req.on("error", reject);
+      req.end(body);
+    });
+  }
+
+  /**
+   * Finds running Antigravity language server processes and their CSRF tokens.
+   */
+  public async detectLocalProcesses(): Promise<DetectedProcess[]> {
+    const raw: { pid: number; name: string; commandLine: string }[] = [];
+
+    try {
+      if (process.platform === "win32") {
+        const script =
+          "Get-CimInstance Win32_Process | " +
+          "Where-Object { $_.Name -match 'language_server|^agy' -or ($_.CommandLine -match 'csrf_token' -and $_.CommandLine -match 'antigravity') } | " +
+          "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress";
+        const { stdout } = await execFileAsync(
+          "powershell.exe",
+          ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+          { windowsHide: true, timeout: 8000, maxBuffer: 8 * 1024 * 1024 }
+        );
+        const text = stdout.trim();
+        if (text) {
+          const parsed = JSON.parse(text);
+          const list = Array.isArray(parsed) ? parsed : [parsed];
+          for (const p of list) {
+            raw.push({ pid: Number(p.ProcessId), name: String(p.Name || ""), commandLine: String(p.CommandLine || "") });
+          }
+        }
+      } else {
+        const { stdout } = await execFileAsync("ps", ["-eo", "pid=,args="], { timeout: 5000, maxBuffer: 8 * 1024 * 1024 });
+        for (const line of stdout.split(/\r?\n/)) {
+          const m = line.trim().match(/^(\d+)\s+(.*)$/);
+          if (!m) continue;
+          const args = m[2];
+          const exe = args.split(/\s+/)[0] || "";
+          const base = path.basename(exe);
+          if (/language_server/i.test(base) || /^agy\b/i.test(base) || (/csrf_token/.test(args) && /antigravity/i.test(args))) {
+            raw.push({ pid: Number(m[1]), name: base, commandLine: args });
+          }
+        }
+      }
+    } catch (err: any) {
+      this.diag(`Process listing failed: ${String(err?.message || err)}`);
+      return [];
+    }
+
+    const result: DetectedProcess[] = [];
+    for (const r of raw) {
+      if (!r.commandLine) {
+        this.diag(`  pid=${r.pid} (${r.name}) command line unavailable (permission?)`);
+      }
+      const get = (flag: string): string => {
+        const m = r.commandLine.match(new RegExp(`--?${flag}(?:=|\\s+)"?([^\\s"]+)`));
+        return m ? m[1] : "";
+      };
+      const argPorts: number[] = [];
+      const portRe = /--?[a-z_]*port(?:=|\s+)(\d{2,5})\b/gi;
+      let pm: RegExpExecArray | null;
+      while ((pm = portRe.exec(r.commandLine)) !== null) {
+        argPorts.push(parseInt(pm[1], 10));
+      }
+      result.push({
+        pid: r.pid,
+        name: r.name,
+        commandLine: r.commandLine,
+        csrfToken: get("csrf_token"),
+        extensionCsrfToken: get("extension_server_csrf_token"),
+        argPorts
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Lists TCP ports in LISTEN state owned by the given PIDs.
+   */
+  public async listListeningPorts(pids: number[]): Promise<{ pid: number; host: string; port: number }[]> {
+    const pidSet = new Set(pids);
+    const out: { pid: number; host: string; port: number }[] = [];
+    const push = (pid: number, addr: string, port: number) => {
+      if (!pidSet.has(pid) || !port) return;
+      const host = addr.includes("::1") || addr === "[::1]" ? "::1" : "127.0.0.1";
+      if (!out.some((o) => o.pid === pid && o.port === port)) out.push({ pid, host, port });
+    };
+
+    try {
+      if (process.platform === "win32") {
+        const { stdout } = await execFileAsync("netstat", ["-ano", "-p", "TCP"], { windowsHide: true, timeout: 8000, maxBuffer: 8 * 1024 * 1024 });
+        // Also include IPv6 listeners
+        let v6 = "";
+        try {
+          v6 = (await execFileAsync("netstat", ["-ano", "-p", "TCPv6"], { windowsHide: true, timeout: 8000, maxBuffer: 8 * 1024 * 1024 })).stdout;
+        } catch {
+          // ignore
+        }
+        for (const line of (stdout + "\n" + v6).split(/\r?\n/)) {
+          const parts = line.trim().split(/\s+/);
+          // Proto  Local Address  Foreign Address  State  PID
+          if (parts.length < 5 || !/^TCP/i.test(parts[0])) continue;
+          if (!/LISTEN/i.test(parts[3])) continue;
+          const local = parts[1];
+          const idx = local.lastIndexOf(":");
+          push(parseInt(parts[4], 10), local.slice(0, idx), parseInt(local.slice(idx + 1), 10));
+        }
+      } else {
+        try {
+          const { stdout } = await execFileAsync("lsof", ["-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-p", pids.join(",")], { timeout: 5000 });
+          for (const line of stdout.split(/\r?\n/).slice(1)) {
+            const parts = line.trim().split(/\s+/);
+            if (parts.length < 9) continue;
+            const name = parts[8];
+            const idx = name.lastIndexOf(":");
+            push(parseInt(parts[1], 10), name.slice(0, idx), parseInt(name.slice(idx + 1), 10));
+          }
+        } catch {
+          const { stdout } = await execFileAsync("ss", ["-ltnpH"], { timeout: 5000 });
+          for (const line of stdout.split(/\r?\n/)) {
+            const pidMatch = line.match(/pid=(\d+)/);
+            const parts = line.trim().split(/\s+/);
+            if (!pidMatch || parts.length < 4) continue;
+            const local = parts[3];
+            const idx = local.lastIndexOf(":");
+            push(parseInt(pidMatch[1], 10), local.slice(0, idx), parseInt(local.slice(idx + 1), 10));
+          }
+        }
+      }
+    } catch (err: any) {
+      this.diag(`Port listing failed: ${String(err?.message || err)}`);
+    }
+
+    this.diag(`Listening ports: ${out.map((o) => `${o.pid}:${o.port}`).join(", ") || "(none found)"}`);
+    return out;
   }
 
   /**
@@ -248,13 +486,13 @@ export class QuotaService {
         });
         clearTimeout(timeoutId);
 
+        this.diag(`Cloud ${new URL(url).host} -> HTTP ${resp.status}`);
         if (!resp.ok) continue;
 
-        const json = await resp.json();
-        const parsed = this.parseQuotaResponse(json, "cloud");
-        if (parsed) return parsed;
-      } catch {
-        // next host
+        const snap = this.parseBody(await resp.text(), "cloud");
+        if (snap) return snap;
+      } catch (err: any) {
+        this.diag(`Cloud ${url} failed: ${String(err?.message || err)}`);
       }
     }
     return null;
@@ -276,6 +514,11 @@ export class QuotaService {
         if (!fs.existsSync(p)) continue;
         const raw = fs.readFileSync(p, "utf-8");
         const data = JSON.parse(raw);
+        const expiry = Number(data.expiry_date || data.expires_at || 0);
+        if (expiry && expiry < Date.now()) {
+          this.diag(`Token in ${p} is expired; skipping`);
+          continue;
+        }
         if (data.access_token) return data.access_token;
         if (data.token) return data.token;
         if (data.credentials?.access_token) return data.credentials.access_token;
@@ -287,90 +530,112 @@ export class QuotaService {
   }
 
   /**
-   * Parses the JSON payload from RetrieveUserQuotaSummary or GetUserStatus
+   * Parses the JSON payload from RetrieveUserQuotaSummary or GetUserStatus.
+   * Walks the whole tree so it tolerates wrappers (`response`, `userQuota`,
+   * `userStatus`, ...) and both bucket-style and per-model `quotaInfo` layouts.
+   * Returns null when no quota information is present.
    */
   public parseQuotaResponse(data: any, source: "local" | "cloud"): AntigravityQuotaSnapshot | null {
-    if (!data) return null;
+    if (!data || typeof data !== "object") return null;
 
     const snapshot: AntigravityQuotaSnapshot = {
       lastUpdated: Date.now(),
       source
     };
+    let found = 0;
 
-    // Case 1: RetrieveUserQuotaSummary format
-    // Payload may be directly root or wrapped in `userQuota` or `response`
-    const quotaData = data.userQuota || data.response || data;
-    const groups = quotaData.groups || [];
-
-    for (const group of groups) {
-      const groupName = (group.displayName || group.name || "").toLowerCase();
-      const buckets = group.buckets || [];
-
-      for (const bucket of buckets) {
-        const bucketId = (bucket.bucketId || bucket.id || "").toLowerCase();
-        const fraction = typeof bucket.remainingFraction === "number" ? bucket.remainingFraction : 1.0;
-        const pct = Math.round(fraction * 100);
-        const resetTime = bucket.resetTime || bucket.nextResetTime || null;
-        const windowType = (bucket.window || "").toUpperCase();
-
-        const b: QuotaBucket = {
-          bucketId: bucket.bucketId || "",
-          displayName: bucket.displayName || group.displayName || "",
-          remainingFraction: fraction,
-          percentage: pct,
-          resetTime,
-          window: windowType.includes("FIVE") || bucketId.includes("5h") ? "FIVE_HOURS" : "WEEKLY"
-        };
-
-        // Classify bucket
-        if (groupName.includes("argon") || bucketId.includes("argon")) {
-          snapshot.geminiArgonWeekly = b;
-        } else if (groupName.includes("claude") || groupName.includes("gpt") || bucketId.includes("3p")) {
-          if (b.window === "FIVE_HOURS") {
-            snapshot.claude5h = b;
-          } else {
-            snapshot.claudeWeekly = b;
-          }
-        } else {
-          // Gemini models
-          if (b.window === "FIVE_HOURS") {
-            snapshot.gemini5h = b;
-          } else {
-            snapshot.geminiWeekly = b;
-          }
-        }
+    const labelOf = (o: any): string => {
+      const parts: string[] = [];
+      for (const k of ["displayName", "label", "name", "model", "modelName", "bucketId", "id", "title"]) {
+        if (typeof o?.[k] === "string" && o[k]) parts.push(o[k]);
       }
-    }
+      return parts.join(" ");
+    };
 
-    // Case 2: GetUserStatus fallback
-    if (!snapshot.gemini5h && !snapshot.geminiWeekly && data.userStatus) {
-      const configs = data.userStatus?.cascadeModelConfigData?.clientModelConfigs || [];
-      for (const cfg of configs) {
-        const model = (cfg.model || "").toLowerCase();
-        const quotaInfo = cfg.quotaInfo;
-        if (!quotaInfo) continue;
+    const assign = (slot: Slot, b: QuotaBucket) => {
+      const existing = snapshot[slot];
+      if (!existing || b.percentage < existing.percentage) snapshot[slot] = b;
+    };
 
-        const fraction = typeof quotaInfo.remainingFraction === "number" ? quotaInfo.remainingFraction : 1.0;
-        const b: QuotaBucket = {
-          bucketId: model,
-          displayName: cfg.displayName || model,
-          remainingFraction: fraction,
-          percentage: Math.round(fraction * 100),
-          resetTime: quotaInfo.resetTime || null,
-          window: "FIVE_HOURS"
-        };
-
-        if (model.includes("argon")) {
-          snapshot.geminiArgonWeekly = b;
-        } else if (model.includes("claude") || model.includes("gpt")) {
-          snapshot.claude5h = b;
-        } else if (model.includes("gemini")) {
-          snapshot.gemini5h = b;
-        }
+    const handle = (q: any, owner: any, ctx: string[], isModelEntry: boolean) => {
+      const bucketId = String(q.bucketId || owner.bucketId || q.id || "");
+      const description = String(q.description || q.message || owner.description || "");
+      let fraction: number;
+      if (typeof q.remainingFraction === "number") {
+        fraction = q.remainingFraction;
+      } else if (typeof q.remainingFraction === "string" && !isNaN(parseFloat(q.remainingFraction))) {
+        fraction = parseFloat(q.remainingFraction);
+      } else {
+        // proto3 JSON omits zero values; infer from description when possible
+        fraction = /reached|used all|exhausted|out of|no .*remaining/i.test(description) ? 0 : 1;
       }
-    }
+      fraction = Math.max(0, Math.min(1, fraction));
 
-    return snapshot;
+      const ownLabel = labelOf(owner) + (owner !== q ? " " + labelOf(q) : "");
+      const modelText = [bucketId, ownLabel, ...ctx].join(" ").toLowerCase();
+      const windowText = [String(q.window || owner.window || ""), bucketId, ownLabel, ...ctx].join(" ").toLowerCase();
+
+      let window: QuotaBucket["window"];
+      if (/week|wtu|7d|seven/.test(windowText)) window = "WEEKLY";
+      else if (/5h|five|5-hour|5 hour|hour|session|rolling/.test(windowText)) window = "FIVE_HOURS";
+      else window = isModelEntry ? "FIVE_HOURS" : "FIVE_HOURS";
+
+      const b: QuotaBucket = {
+        bucketId,
+        displayName: String(q.displayName || owner.displayName || owner.label || ctx[ctx.length - 1] || bucketId),
+        remainingFraction: fraction,
+        percentage: Math.round(fraction * 100),
+        resetTime: q.resetTime || q.nextResetTime || owner.resetTime || null,
+        window
+      };
+
+      if (/argon/.test(modelText)) {
+        b.window = "WEEKLY";
+        assign("geminiArgonWeekly", b);
+      } else if (/claude|gpt|anthropic|openai|sonnet|opus|\b3p\b|3p-|third.?party|oss/.test(modelText)) {
+        assign(window === "WEEKLY" ? "claudeWeekly" : "claude5h", b);
+      } else {
+        assign(window === "WEEKLY" ? "geminiWeekly" : "gemini5h", b);
+      }
+      found++;
+    };
+
+    const walk = (node: any, ctx: string[], depth: number) => {
+      if (depth > 12 || node === null || typeof node !== "object") return;
+      if (Array.isArray(node)) {
+        for (const item of node) walk(item, ctx, depth + 1);
+        return;
+      }
+
+      // Account metadata
+      if (!snapshot.accountEmail && typeof node.email === "string") snapshot.accountEmail = node.email;
+      if (!snapshot.planName) {
+        const plan = node.planName || node.tierName || node.userTier?.name || node.planInfo?.planName;
+        if (typeof plan === "string" && plan) snapshot.planName = plan;
+      }
+
+      const isBucket = node.remainingFraction !== undefined
+        || (typeof node.bucketId === "string" && (node.resetTime !== undefined || node.window !== undefined));
+      if (isBucket) {
+        handle(node, node, ctx, false);
+        return;
+      }
+
+      const label = labelOf(node);
+      const nextCtx = label ? [...ctx, label] : ctx;
+
+      if (node.quotaInfo && typeof node.quotaInfo === "object") {
+        handle(node.quotaInfo, node, ctx, true);
+      }
+
+      for (const [k, v] of Object.entries(node)) {
+        if (k === "quotaInfo") continue;
+        if (v && typeof v === "object") walk(v, nextCtx, depth + 1);
+      }
+    };
+
+    walk(data, [], 0);
+    return found > 0 ? snapshot : null;
   }
 
   public createDemoSnapshot(): AntigravityQuotaSnapshot {

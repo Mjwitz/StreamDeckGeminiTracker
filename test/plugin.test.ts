@@ -130,3 +130,91 @@ test("QuotaService createDemoSnapshot returns all 4 key quotas", () => {
   assert.ok(demo.geminiArgonWeekly);
   assert.equal(demo.source, "demo");
 });
+
+test("QuotaService parses Connect RPC response wrapper with missing remainingFraction", () => {
+  const payload = {
+    response: {
+      groups: [
+        {
+          name: "Gemini Pro / Flash",
+          buckets: [
+            {
+              bucketId: "gemini-5h",
+              window: "FIVE_HOURS",
+              // remainingFraction omitted because it is 0 in proto3
+              description: "You have reached your 5-hour limit",
+              resetTime: "2026-11-12T04:00:00Z"
+            }
+          ]
+        },
+        {
+          name: "Claude Sonnet 3.5",
+          buckets: [
+            {
+              bucketId: "3p-weekly",
+              window: "WEEKLY",
+              remainingFraction: 0.15,
+              resetTime: "2026-11-19T00:00:00Z"
+            }
+          ]
+        }
+      ]
+    }
+  };
+
+  const service = QuotaService.getInstance();
+  const snapshot = service.parseQuotaResponse(payload, "local");
+  assert.ok(snapshot);
+  assert.equal(snapshot.gemini5h?.percentage, 0);
+  assert.equal(snapshot.claudeWeekly?.percentage, 15);
+});
+
+test("QuotaService parses GetUserStatus clientModelConfigs quotaInfo format", () => {
+  const payload = {
+    userStatus: {
+      cascadeModelConfigData: {
+        clientModelConfigs: [
+          {
+            model: "gemini-2.5-pro",
+            displayName: "Gemini 2.5 Pro",
+            quotaInfo: {
+              remainingFraction: 0.85,
+              resetTime: "2026-11-12T05:00:00Z"
+            }
+          },
+          {
+            model: "claude-3-5-sonnet",
+            displayName: "Claude 3.5 Sonnet",
+            quotaInfo: {
+              remainingFraction: 0.40,
+              resetTime: "2026-11-12T05:00:00Z"
+            }
+          },
+          {
+            model: "gemini-4-argon",
+            displayName: "Gemini 4 Argon",
+            quotaInfo: {
+              remainingFraction: 0.90,
+              resetTime: "2026-11-18T00:00:00Z"
+            }
+          }
+        ]
+      }
+    }
+  };
+
+  const service = QuotaService.getInstance();
+  const snapshot = service.parseQuotaResponse(payload, "local");
+  assert.ok(snapshot);
+  assert.equal(snapshot.gemini5h?.percentage, 85);
+  assert.equal(snapshot.claude5h?.percentage, 40);
+  assert.equal(snapshot.geminiArgonWeekly?.percentage, 90);
+});
+
+test("QuotaService returns null for unrelated payload", () => {
+  const service = QuotaService.getInstance();
+  assert.equal(service.parseQuotaResponse({}, "local"), null);
+  assert.equal(service.parseQuotaResponse({ status: "ok" }, "local"), null);
+  assert.equal(service.parseQuotaResponse(null, "local"), null);
+});
+
