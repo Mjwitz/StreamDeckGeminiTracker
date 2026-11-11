@@ -1,0 +1,151 @@
+{
+  "Name": "Antigravity AI Tracker",
+  "Version": "1.0.0.0",
+  "Author": "Mjwitz",
+  "Actions": [
+    {
+      "Name": "Gemini Weekly Limit",
+      "UUID": "com.mjwitz.gemini-tracker.weekly",
+      "Icon": "imgs/actions/weekly/icon",
+      "Tooltip": "Tracks remaining weekly quota and reset timer for Gemini models in Antigravity",
+      "PropertyInspectorPath": "ui/inspector.html",
+      "Controllers": [
+        "Keypad",
+        "Encoder"
+      ],
+      "States": [
+        {
+          "Image": "imgs/actions/weekly/key",
+          "TitleAlignment": "middle"
+        }
+      ],
+      "Encoder": {
+        "Icon": "imgs/actions/weekly/key",
+        "TriggerDescription": {
+          "Touch": "Refresh Quota",
+          "Rotate": "Toggle View"
+        }
+      }
+    },
+    {
+      "Name": "Gemini 5-Hour Limit",
+      "UUID": "com.mjwitz.gemini-tracker.five-hour",
+      "Icon": "imgs/actions/five-hour/icon",
+      "Tooltip": "Tracks remaining 5-hour rolling session quota and countdown for Gemini in Antigravity",
+      "PropertyInspectorPath": "ui/inspector.html",
+      "Controllers": [
+        "Keypad",
+        "Encoder"
+      ],
+      "States": [
+        {
+          "Image": "imgs/actions/five-hour/key",
+          "TitleAlignment": "middle"
+        }
+      ],
+      "Encoder": {
+        "Icon": "imgs/actions/five-hour/key",
+        "TriggerDescription": {
+          "Touch": "Refresh Quota",
+          "Rotate": "Toggle View"
+        }
+      }
+    },
+    {
+      "Name": "Claude & GPT Limit",
+      "UUID": "com.mjwitz.gemini-tracker.claude-gpt",
+      "Icon": "imgs/actions/claude-gpt/icon",
+      "Tooltip": "Tracks remaining quota for Claude and GPT models in Antigravity",
+      "PropertyInspectorPath": "ui/inspector.html",
+      "Controllers": [
+        "Keypad",
+        "Encoder"
+      ],
+      "States": [
+        {
+          "Image": "imgs/actions/claude-gpt/key",
+          "TitleAlignment": "middle"
+        }
+      ],
+      "Encoder": {
+        "Icon": "imgs/actions/claude-gpt/key",
+        "TriggerDescription": {
+          "Touch": "Refresh Quota",
+          "Rotate": "Switch 5h / Weekly"
+        }
+      }
+    },
+    {
+      "Name": "Gemini 4 Argon Limit",
+      "UUID": "com.mjwitz.gemini-tracker.gemini-argon",
+      "Icon": "imgs/actions/gemini-argon/icon",
+      "Tooltip": "Tracks dedicated weekly quota for Gemini 4 Argon reasoning model in Antigravity",
+      "PropertyInspectorPath": "ui/inspector.html",
+      "Controllers": [
+        "Keypad",
+        "Encoder"
+      ],
+      "States": [
+        {
+          "Image": "imgs/actions/gemini-argon/key",
+          "TitleAlignment": "middle"
+        }
+      ],
+      "Encoder": {
+        "Icon": "imgs/actions/gemini-argon/key",
+        "TriggerDescription": {
+          "Touch": "Refresh Quota",
+          "Rotate": "Toggle View"
+        }
+      }
+    },
+    {
+      "Name": "Antigravity Multi-Metric / Cycle",
+      "UUID": "com.mjwitz.gemini-tracker.cycle",
+      "Icon": "imgs/actions/cycle/icon",
+      "Tooltip": "Cycles through all Antigravity AI limits on press or displays lowest remaining quota",
+      "PropertyInspectorPath": "ui/inspector.html",
+      "Controllers": [
+        "Keypad",
+        "Encoder"
+      ],
+      "States": [
+        {
+          "Image": "imgs/actions/cycle/key",
+          "TitleAlignment": "middle"
+        }
+      ],
+      "Encoder": {
+        "Icon": "imgs/actions/cycle/key",
+        "TriggerDescription": {
+          "Touch": "Next Metric",
+          "Rotate": "Cycle Metric"
+        }
+      }
+    }
+  ],
+  "Category": "Antigravity AI Tracker",
+  "CategoryIcon": "imgs/plugin/category-icon",
+  "CodePath": "bin/plugin.js",
+  "Description": "Monitor your Antigravity AI quotas directly on your Stream Deck: Weekly limit, 5-Hour rolling limit, Claude and GPT usage, and Gemini 4 Argon reasoning model limit.",
+  "Icon": "imgs/plugin/marketplace",
+  "SDKVersion": 3,
+  "Software": {
+    "MinimumVersion": "7.1"
+  },
+  "OS": [
+    {
+      "Platform": "mac",
+      "MinimumVersion": "12"
+    },
+    {
+      "Platform": "windows",
+      "MinimumVersion": "10"
+    }
+  ],
+  "Nodejs": {
+    "Version": "20",
+    "Debug": "enabled"
+  },
+  "UUID": "com.mjwitz.gemini-tracker"
+}
