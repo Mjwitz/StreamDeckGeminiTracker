@@ -218,3 +218,49 @@ test("QuotaService returns null for unrelated payload", () => {
   assert.equal(service.parseQuotaResponse(null, "local"), null);
 });
 
+test("QuotaService parseAgyUsageOutput parses standard agy -p /usage TSV output", () => {
+  const tsv = [
+    "Gemini Models\tWeekly Limit Remaining\t80%\t2026-11-24T23:28:29Z",
+    "Gemini Models\tFive Hour Limit Remaining\t81%\t2026-11-21T09:18:33Z",
+    "Claude and GPT models\tWeekly Limit Remaining\t64%\t2026-11-28T05:16:42Z",
+    "Claude and GPT models\tFive Hour Limit Remaining\t72%\t2026-11-21T10:16:42Z",
+    "Gemini 4 Argon\tGemini 4 Argon Weekly Limit\t95%\t2026-11-28T05:16:42Z"
+  ].join("\n");
+
+  const service = QuotaService.getInstance();
+  const snapshot = service.parseAgyUsageOutput(tsv);
+
+  assert.ok(snapshot);
+  assert.equal(snapshot.source, "cli");
+  assert.equal(snapshot.geminiWeekly?.percentage, 80);
+  assert.equal(snapshot.geminiWeekly?.resetTime, "2026-11-24T23:28:29Z");
+  assert.equal(snapshot.gemini5h?.percentage, 81);
+  assert.equal(snapshot.gemini5h?.resetTime, "2026-11-21T09:18:33Z");
+  assert.equal(snapshot.claudeWeekly?.percentage, 64);
+  assert.equal(snapshot.claude5h?.percentage, 72);
+  assert.equal(snapshot.geminiArgonWeekly?.percentage, 95);
+  assert.equal(snapshot.geminiArgonWeekly?.bucketId, "gemini-argon-wtu-weekly");
+});
+
+test("QuotaService parseAgyUsageOutput handles ANSI codes and JSON envelope", () => {
+  const envelope = JSON.stringify({
+    status: "ok",
+    response: "\x1b[32mGemini Models\tFive Hour Limit Remaining\t45%\t2026-11-21T12:00:00Z\x1b[0m\n" +
+              "Gemini 4 Argon\tWeekly Limit Remaining\t0%\t2026-11-28T00:00:00Z"
+  });
+
+  const service = QuotaService.getInstance();
+  const snapshot = service.parseAgyUsageOutput(envelope);
+
+  assert.ok(snapshot);
+  assert.equal(snapshot.source, "cli");
+  assert.equal(snapshot.gemini5h?.percentage, 45);
+  assert.equal(snapshot.geminiArgonWeekly?.percentage, 0);
+});
+
+test("QuotaService parseAgyUsageOutput returns null for empty or error output", () => {
+  const service = QuotaService.getInstance();
+  assert.equal(service.parseAgyUsageOutput(""), null);
+  assert.equal(service.parseAgyUsageOutput("Error: not logged in. Run agy to sign in."), null);
+});
+

@@ -18,7 +18,7 @@ export interface AntigravityQuotaSnapshot {
   accountEmail?: string;
   planName?: string;
   lastUpdated: number;
-  source: "local" | "cloud" | "demo" | "offline";
+  source: "cli" | "local" | "cloud" | "demo" | "offline";
   errorMessage?: string;
 }
 
@@ -39,11 +39,12 @@ export interface PluginSettings extends JsonObject {
   showCountdown?: string | boolean;
   warningThreshold?: number;
   criticalThreshold?: number;
-  dataSource?: "auto" | "cloud" | "demo";
+  dataSource?: "auto" | "cli" | "cloud" | "demo";
   refreshInterval?: string | number;
   claudeWindow?: "auto" | "five-hour" | "weekly";
   authToken?: string;
   manualPort?: string | number;
+  agyPath?: string;
   cycleInterval?: number;
   cycleIndex?: number;
   [key: string]: JsonValue | undefined;

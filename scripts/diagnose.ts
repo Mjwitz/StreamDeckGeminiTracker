@@ -22,49 +22,35 @@ async function main() {
     error: (...args) => console.error("ERR:", ...args)
   });
 
-  console.log("1. Scanning for Antigravity processes...");
+  console.log("1. Checking official Antigravity CLI (agy) candidates...");
+  const agyCandidates = service.resolveAgyBinary();
+  for (const c of agyCandidates) {
+    const exists = path.isAbsolute(c) ? fs.existsSync(c) : "PATH";
+    console.log(`   • ${c} (${exists === true ? "found" : exists === "PATH" ? "PATH lookup" : "missing"})`);
+  }
+  console.log();
+
+  console.log("2. Scanning for running Antigravity processes...");
   const procs = await service.detectLocalProcesses();
   if (procs.length === 0) {
-    console.log("   ⚠ No candidate processes found!");
-    console.log("   Make sure the Antigravity desktop app is running and active.");
+    console.log("   • No running language_server processes found (not required if agy CLI is installed).");
   } else {
     for (const p of procs) {
       console.log(`   ✔ PID ${p.pid}: ${p.name}`);
-      console.log(`     Command line: ${p.commandLine.slice(0, 160)}${p.commandLine.length > 160 ? "…" : ""}`);
-      console.log(`     CSRF token: ${p.csrfToken ? `${p.csrfToken.slice(0, 4)}…` : "(none)"}`);
-      console.log(`     Extension CSRF token: ${p.extensionCsrfToken ? `${p.extensionCsrfToken.slice(0, 4)}…` : "(none)"}`);
-      if (p.argPorts.length) {
-        console.log(`     CLI port flags: ${p.argPorts.join(", ")}`);
+      if (p.usesStdinBridgeToken && !p.csrfToken) {
+        console.log("     ℹ Antigravity v2.34+ detected (--read_host_bridge_token_from_stdin). Local RPC is locked down; agy CLI will be used.");
+      } else {
+        console.log(`     CSRF token: ${p.csrfToken ? `${p.csrfToken.slice(0, 4)}…` : "(none)"}`);
       }
     }
   }
   console.log();
 
-  if (procs.length > 0) {
-    console.log("2. Checking TCP listening ports for detected PIDs...");
-    const ports = await service.listListeningPorts(procs.map((p) => p.pid));
-    if (ports.length === 0) {
-      console.log("   ⚠ No listening TCP ports detected for these PIDs.");
-      console.log("   (On Windows, make sure netstat is accessible)");
-    } else {
-      for (const pt of ports) {
-        console.log(`   ✔ PID ${pt.pid} listening on ${pt.host}:${pt.port}`);
-      }
-    }
-    console.log();
-  }
-
-  console.log("3. Probing language server endpoint for quota data...");
+  console.log("3. Fetching quota (Auto: agy CLI -> Local RPC -> Cloud)...");
   const snapshot = await service.getQuota({ dataSource: "auto" }, true);
   console.log();
 
-  console.log("4. Probe Trace:");
-  for (const line of service.lastDiagnostics) {
-    console.log(`   ${line}`);
-  }
-  console.log();
-
-  console.log("5. Result Snapshot:");
+  console.log("4. Result Snapshot:");
   console.log(`   Source: ${snapshot.source}`);
   if (snapshot.errorMessage) {
     console.log(`   Error:  ${snapshot.errorMessage}`);
@@ -92,22 +78,25 @@ async function main() {
   }
 
   if (service.lastRawResponse) {
-    const outPath = path.resolve(process.cwd(), "diagnose-output.json");
-    fs.writeFileSync(outPath, JSON.stringify(service.lastRawResponse, null, 2), "utf-8");
+    const outPath = path.resolve(process.cwd(), "diagnose-output.txt");
+    const serialized = typeof service.lastRawResponse === "string"
+      ? service.lastRawResponse
+      : JSON.stringify(service.lastRawResponse, null, 2);
+    fs.writeFileSync(outPath, serialized, "utf-8");
     console.log();
     console.log(`   ✔ Raw response written to: ${outPath}`);
   }
 
   console.log();
   if (snapshot.source === "offline") {
-    console.log("❌ Detection unsuccessful.");
+    console.log("❌ Quota detection unsuccessful.");
     console.log("Tips:");
-    console.log("1. Check if the Antigravity app is fully loaded with a project open.");
-    console.log("2. You can test your Stream Deck buttons immediately by setting Data Source to 'Demo' in Property Inspector.");
-    console.log("3. Share the output above to diagnose the exact issue.");
+    console.log("1. Antigravity v2.34.0+ removed local RPC tokens; make sure the official 'agy' CLI is installed and signed in.");
+    console.log("2. Test manually in your terminal:  agy -p \"/usage\" --print-timeout 45s");
+    console.log("3. If 'agy' is installed in a custom path, set 'agy CLI Path' in the Stream Deck Property Inspector.");
     process.exitCode = 1;
   } else {
-    console.log("✅ Quota successfully detected!");
+    console.log(`✅ Quota successfully detected via ${snapshot.source}!`);
   }
 }
 

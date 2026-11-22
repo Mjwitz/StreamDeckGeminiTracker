@@ -95,22 +95,19 @@ Click any action on your Stream Deck canvas to open the **Property Inspector**:
 
 ---
 
-## 🔍 How Local Detection Works
+## 🔍 How Quota Detection Works
 
-When Antigravity runs (via the Desktop IDE or `agy` CLI), it spawns an internal language server process:
-1. The plugin discovers the process and reads the command-line arguments:
-   - `--csrf_token <token>`
-   - `--extension_server_port <port>`
-2. It sends an HTTP POST request to the local Connect RPC endpoint:
-   ```http
-   POST http://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary
-   Headers:
-     X-Codeium-Csrf-Token: <token>
-     Connect-Protocol-Version: 1
-     Content-Type: application/json
-   Body: {}
-   ```
-3. It parses the resulting quota buckets (`gemini-5h`, `gemini-weekly`, `3p-5h`, `3p-weekly`, and `gemini-argon-wtu-weekly`) and immediately updates the Stream Deck displays with zero latency.
+Starting with **Antigravity v2.34.0** (November 2026), Google removed the `--csrf_token` flag from the local `language_server` process and switched to one-time stdin/renderer bootstrap tokens, closing direct local RPC probing.
+
+The plugin now uses a layered, zero-token strategy:
+1. **Official Antigravity CLI (`agy`) — Primary (Antigravity 2.34+):**
+   - Runs `agy -p "/usage" --print-timeout 45s` headlessly in the background (no console window, no LLM tokens consumed, and works even when the desktop app is closed).
+   - Parses the tab-separated quota summary for all pools (`Gemini Weekly`, `Gemini 5-Hour`, `Claude & GPT`, and `Gemini 4 Argon`).
+   - Automatically searches standard Windows (`%LOCALAPPDATA%\agy\bin\agy.exe`, `%LOCALAPPDATA%\Antigravity\agy.exe`, etc.), macOS, and Linux install locations as well as `PATH`.
+2. **Legacy Local RPC Fallback (Antigravity < 2.34):**
+   - If an older `language_server` with `--csrf_token` is running, falls back to querying `RetrieveUserQuotaSummary` / `GetUserStatus` over loopback.
+3. **Cloud Code PA API Fallback:**
+   - Optionally uses a provided OAuth bearer token or cached credentials from `~/.gemini/`.
 
 ---
 

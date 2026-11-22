@@ -101,7 +101,8 @@
 
   <sdpi-item label="Data Source">
     <sdpi-select setting="dataSource" default="auto">
-      <option value="auto">Auto-Detect Local Antigravity (Zero-Config)</option>
+      <option value="auto">Auto (Antigravity CLI → Local → Cloud)</option>
+      <option value="cli">Antigravity CLI (agy -p /usage)</option>
       <option value="cloud">Google Cloud Code API (OAuth / Token)</option>
       <option value="demo">Demo / Simulation Mode (Test Data)</option>
     </sdpi-select>
@@ -125,17 +126,21 @@
     </sdpi-select>
   </sdpi-item>
 
+  <sdpi-item label="agy CLI Path (Optional)">
+    <sdpi-textfield setting="agyPath" placeholder="Auto-detected if left empty"></sdpi-textfield>
+  </sdpi-item>
+
   <sdpi-item label="OAuth Token (Optional)">
     <sdpi-textfield setting="authToken" placeholder="Paste bearer token if using remote API"></sdpi-textfield>
   </sdpi-item>
 
   <sdpi-item label="Manual Port (Optional)">
-    <sdpi-textfield setting="manualPort" placeholder="Auto-detected if left empty"></sdpi-textfield>
+    <sdpi-textfield setting="manualPort" placeholder="Legacy local RPC port (Antigravity < 2.34)"></sdpi-textfield>
   </sdpi-item>
 
   <div class="help-box">
     <strong>💡 Tip:</strong> Press the key on your Stream Deck anytime to trigger an immediate live refresh!
-    In <em>Auto</em> mode, the plugin automatically detects your running Antigravity IDE, App, or <code>agy</code> CLI session and extracts your local quota without consuming tokens.
+    For Antigravity 2.34+, install and sign in to the official <code>agy</code> CLI — the plugin runs <code>agy -p /usage</code> in the background (even when the desktop app is closed) with zero token usage.
   </div>
 </body>
 </html>

@@ -28,6 +28,7 @@ export interface DetectedProcess {
   csrfToken: string;
   extensionCsrfToken: string;
   argPorts: number[];
+  usesStdinBridgeToken: boolean;
 }
 
 interface LocalProbeTarget {
@@ -43,18 +44,24 @@ interface HttpResult {
 
 type Slot = "gemini5h" | "geminiWeekly" | "claude5h" | "claudeWeekly" | "geminiArgonWeekly";
 
+// Strip ANSI escape codes from CLI output
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+
 export class QuotaService {
   private static instance: QuotaService;
   private cachedSnapshot: AntigravityQuotaSnapshot | null = null;
   private inFlightPromise: Promise<AntigravityQuotaSnapshot> | null = null;
   private lastFetchTime = 0;
-  private cacheTtlMs = 15000; // 15-second minimum cache across multiple keys
+  private cacheTtlMs = 30000; // 30-second minimum cache across multiple keys
   private logger: QuotaLogger | null = null;
   private lastGoodTarget: { scheme: "https" | "http"; host: string; port: number; token: string; method: string } | null = null;
+  private resolvedAgyBin: string | null = null;
+  private cliBackoffUntil = 0;
 
   /** Human-readable trace of the most recent fetch (tokens redacted). */
   public lastDiagnostics: string[] = [];
-  /** Raw JSON body of the last successful local/cloud response. */
+  /** Raw JSON or text body of the last successful CLI/local/cloud response. */
   public lastRawResponse: unknown = null;
 
   public static getInstance(): QuotaService {
@@ -95,8 +102,12 @@ export class QuotaService {
       return this.inFlightPromise;
     }
 
+    if (forceRefresh) {
+      this.cliBackoffUntil = 0;
+    }
+
     this.lastDiagnostics = [];
-    this.inFlightPromise = this.fetchInternal(settings)
+    this.inFlightPromise = this.fetchInternal(settings, forceRefresh)
       .then((snapshot) => {
         // Don't let a transient offline result wipe out recent good data
         if (snapshot.source === "offline" && this.cachedSnapshot && this.cachedSnapshot.source !== "offline"
@@ -119,11 +130,17 @@ export class QuotaService {
     return this.inFlightPromise;
   }
 
-  private async fetchInternal(settings: PluginSettings): Promise<AntigravityQuotaSnapshot> {
+  private async fetchInternal(settings: PluginSettings, forceRefresh: boolean): Promise<AntigravityQuotaSnapshot> {
     const dataSource = settings.dataSource || "auto";
 
     if (dataSource === "demo") {
       return this.createDemoSnapshot();
+    }
+
+    if (dataSource === "cli") {
+      const cliResult = await this.fetchFromAgyCli(settings.agyPath, forceRefresh);
+      if (cliResult) return cliResult;
+      return this.createOfflineSnapshot("Antigravity CLI (agy) failed or not installed");
     }
 
     if (dataSource === "cloud" && settings.authToken) {
@@ -131,12 +148,36 @@ export class QuotaService {
       if (cloudResult) return cloudResult;
     }
 
-    // Auto mode: probe local language server first
+    // If user explicitly provided a manual port, probe local server first
+    if (settings.manualPort) {
+      try {
+        const localResult = await this.probeLocalLanguageServer(settings.manualPort);
+        if (localResult) return localResult;
+      } catch (err: any) {
+        this.diag(`Local probe failed: ${String(err?.message || err)}`);
+      }
+    }
+
+    // Primary method (Antigravity 2.34+): official `agy -p /usage` CLI
+    // Antigravity v2.34.0 removed --csrf_token from language_server args and
+    // moved to one-time stdin/renderer bootstrap tokens, closing local RPC probing.
+    let cliErrorHint = "";
     try {
-      const localResult = await this.probeLocalLanguageServer(settings.manualPort);
-      if (localResult) return localResult;
+      const cliResult = await this.fetchFromAgyCli(settings.agyPath, forceRefresh);
+      if (cliResult) return cliResult;
     } catch (err: any) {
-      this.diag(`Local probe failed: ${String(err?.message || err)}`);
+      cliErrorHint = String(err?.message || err);
+      this.diag(`agy CLI failed: ${cliErrorHint}`);
+    }
+
+    // Legacy fallback: probe local language server (works on Antigravity < 2.34)
+    if (!settings.manualPort) {
+      try {
+        const localResult = await this.probeLocalLanguageServer();
+        if (localResult) return localResult;
+      } catch (err: any) {
+        this.diag(`Local probe failed: ${String(err?.message || err)}`);
+      }
     }
 
     // Try finding cached credentials from ~/.gemini
@@ -156,11 +197,242 @@ export class QuotaService {
       if (cloudResult) return cloudResult;
     }
 
-    return this.createOfflineSnapshot("Antigravity Language Server not detected");
+    const msg = cliErrorHint || "Install & sign in to agy CLI (Antigravity 2.34+ closed local RPC)";
+    return this.createOfflineSnapshot(msg);
   }
 
   /**
-   * Probes local Antigravity Language Server
+   * Resolves the official Antigravity CLI (`agy`) binary path across Windows, macOS, and Linux.
+   * Stream Deck runs plugins in a GUI daemon environment with a minimal PATH, so we check
+   * standard install locations before falling back to PATH lookup.
+   */
+  public resolveAgyBinary(customPath?: string): string[] {
+    const candidates: string[] = [];
+    const add = (p: string) => {
+      if (p && !candidates.includes(p)) candidates.push(p);
+    };
+
+    if (customPath && customPath.trim()) {
+      add(customPath.trim().replace(/^"(.*)"$/, "$1"));
+    }
+    if (this.resolvedAgyBin) {
+      add(this.resolvedAgyBin);
+    }
+
+    const home = os.homedir();
+    if (process.platform === "win32") {
+      const localAppData = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
+      const programFiles = process.env.ProgramFiles || "C:\\Program Files";
+      const fileCandidates = [
+        path.join(localAppData, "agy", "bin", "agy.exe"),
+        path.join(localAppData, "Antigravity", "agy.exe"),
+        path.join(localAppData, "Antigravity", "bin", "agy.exe"),
+        path.join(localAppData, "Programs", "Antigravity", "bin", "agy.exe"),
+        path.join(localAppData, "Programs", "Antigravity", "resources", "app", "bin", "agy.cmd"),
+        path.join(home, ".local", "bin", "agy.exe"),
+        path.join(home, ".gemini", "antigravity", "bin", "agy.exe"),
+        path.join(programFiles, "agy", "agy.exe"),
+        path.join(programFiles, "Antigravity", "bin", "agy.exe")
+      ];
+      for (const p of fileCandidates) {
+        if (fs.existsSync(p)) add(p);
+      }
+      add("agy.exe");
+      add("agy");
+    } else {
+      const fileCandidates = [
+        path.join(home, ".local", "bin", "agy"),
+        path.join(home, ".gemini", "antigravity", "bin", "agy"),
+        "/opt/homebrew/bin/agy",
+        "/usr/local/bin/agy"
+      ];
+      for (const p of fileCandidates) {
+        if (fs.existsSync(p)) add(p);
+      }
+      add("agy");
+    }
+
+    return candidates;
+  }
+
+  /**
+   * Queries quota via the official Antigravity CLI: `agy -p "/usage" --print-timeout 45s`.
+   * Works with Antigravity 2.34+ and even when the desktop app is closed.
+   */
+  public async fetchFromAgyCli(customPath?: string, forceRefresh = false): Promise<AntigravityQuotaSnapshot | null> {
+    if (!forceRefresh && Date.now() < this.cliBackoffUntil) {
+      const secsLeft = Math.ceil((this.cliBackoffUntil - Date.now()) / 1000);
+      this.diag(`Skipping agy CLI due to recent auth/timeout backoff (${secsLeft}s remaining; press key to retry)`);
+      return null;
+    }
+
+    const candidates = this.resolveAgyBinary(customPath);
+    this.diag(`Trying agy CLI candidates: ${candidates.join(", ")}`);
+
+    for (const bin of candidates) {
+      try {
+        const isWinBatch = process.platform === "win32" && /\.(cmd|bat)$/i.test(bin);
+        const cmd = isWinBatch ? (process.env.ComSpec || "cmd.exe") : bin;
+        const args = isWinBatch
+          ? ["/d", "/s", "/c", bin, "-p", "/usage", "--print-timeout", "45s"]
+          : ["-p", "/usage", "--print-timeout", "45s"];
+
+        const start = Date.now();
+        const { stdout, stderr } = await execFileAsync(cmd, args, {
+          timeout: 50000,
+          maxBuffer: 2 * 1024 * 1024,
+          cwd: os.homedir(),
+          windowsHide: true
+        });
+        const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+        this.diag(`  agy (${bin}) completed in ${elapsed}s (${stdout.length} bytes stdout)`);
+
+        const parsed = this.parseAgyUsageOutput(stdout);
+        if (parsed) {
+          this.resolvedAgyBin = bin;
+          this.cliBackoffUntil = 0;
+          this.lastRawResponse = stdout;
+          this.diag(`  ✔ Parsed quota from agy CLI`);
+          return parsed;
+        }
+
+        const snippet = (stderr || stdout || "").trim().split(/\r?\n/)[0]?.slice(0, 160) || "(empty output)";
+        this.diag(`  agy returned unparseable output: ${snippet}`);
+        // Back off for 5 minutes if agy ran but returned an auth/error message
+        this.cliBackoffUntil = Date.now() + 5 * 60 * 1000;
+        return null;
+      } catch (err: any) {
+        const code = err?.code;
+        if (code === "ENOENT") {
+          this.diag(`  ${bin}: not found`);
+          continue;
+        }
+        const stderrLine = String(err?.stderr || err?.message || err).trim().split(/\r?\n/)[0]?.slice(0, 160);
+        this.diag(`  agy (${bin}) failed (${code || "err"}): ${stderrLine}`);
+        // Back off to avoid repeatedly spawning agy or triggering browser sign-in popups
+        this.cliBackoffUntil = Date.now() + 5 * 60 * 1000;
+        return null;
+      }
+    }
+
+    this.diag("agy CLI binary not found on this machine");
+    return null;
+  }
+
+  /**
+   * Parses stdout from `agy -p "/usage"`.
+   * Expected TSV format (one bucket per line):
+   *   Gemini Models\tWeekly Limit Remaining\t80%\t2026-11-24T23:28:29Z
+   *   Gemini Models\tFive Hour Limit Remaining\t81%\t2026-11-21T09:18:33Z
+   *   Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-11-28T05:16:42Z
+   *   Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-11-21T10:16:42Z
+   *   Gemini 4 Argon\tGemini 4 Argon Weekly Limit\t100%\t2026-11-28T05:16:42Z
+   */
+  public parseAgyUsageOutput(rawOutput: string): AntigravityQuotaSnapshot | null {
+    if (!rawOutput || typeof rawOutput !== "string") return null;
+
+    const cleaned = rawOutput.replace(ANSI_RE, "").trim();
+    if (!cleaned) return null;
+
+    // Handle JSON envelope if `--output-format json` was ever used
+    if (cleaned.startsWith("{")) {
+      try {
+        const json = JSON.parse(cleaned);
+        if (typeof json.response === "string") {
+          return this.parseAgyUsageOutput(json.response);
+        }
+        const parsedJson = this.parseQuotaResponse(json, "cli");
+        if (parsedJson) return parsedJson;
+      } catch {
+        // fall through to line parser
+      }
+    }
+
+    const snapshot: AntigravityQuotaSnapshot = {
+      lastUpdated: Date.now(),
+      source: "cli"
+    };
+    let found = 0;
+
+    const assign = (slot: Slot, b: QuotaBucket) => {
+      const existing = snapshot[slot];
+      if (!existing || b.percentage < existing.percentage) snapshot[slot] = b;
+    };
+
+    for (const rawLine of cleaned.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      // Primary format: tab-separated columns
+      let cols = line.split("\t").map((c) => c.trim()).filter((c) => c.length > 0);
+      // Fallback: 2+ spaces separated columns
+      if (cols.length < 3) {
+        cols = line.split(/\s{2,}/).map((c) => c.trim()).filter((c) => c.length > 0);
+      }
+      if (cols.length < 3) continue;
+
+      const [group, label, pctText, resetText] = cols;
+      const pctMatch = /(-?\d+(?:\.\d+)?)\s*%/.exec(pctText || "");
+      if (!pctMatch) continue;
+
+      const pctVal = Math.max(0, Math.min(100, Number(pctMatch[1])));
+      const fraction = pctVal / 100;
+      const resetTime = resetText && !Number.isNaN(Date.parse(resetText)) ? resetText : null;
+
+      const g = group.toLowerCase();
+      const l = label.toLowerCase();
+
+      let window: QuotaBucket["window"] | null = null;
+      if (/week|wtu|7d|seven/.test(l)) {
+        window = "WEEKLY";
+      } else if (/five\s*hour|5\s*hour|5-hour|5h|session|rolling/.test(l)) {
+        window = "FIVE_HOURS";
+      }
+
+      // Check Argon before generic Gemini so "Gemini 4 Argon" doesn't collide
+      if (g.includes("argon") || l.includes("argon")) {
+        const b: QuotaBucket = {
+          bucketId: "gemini-argon-wtu-weekly",
+          displayName: label || group,
+          remainingFraction: fraction,
+          percentage: Math.round(pctVal),
+          resetTime,
+          window: "WEEKLY"
+        };
+        assign("geminiArgonWeekly", b);
+        found++;
+      } else if (g.includes("claude") || g.includes("gpt") || g.includes("anthropic") || g.includes("openai") || g.includes("3p")) {
+        if (!window) continue;
+        const b: QuotaBucket = {
+          bucketId: window === "FIVE_HOURS" ? "3p-5h" : "3p-weekly",
+          displayName: label || group,
+          remainingFraction: fraction,
+          percentage: Math.round(pctVal),
+          resetTime,
+          window
+        };
+        assign(window === "FIVE_HOURS" ? "claude5h" : "claudeWeekly", b);
+        found++;
+      } else if (g.includes("gemini")) {
+        if (!window) continue;
+        const b: QuotaBucket = {
+          bucketId: window === "FIVE_HOURS" ? "gemini-5h" : "gemini-weekly",
+          displayName: label || group,
+          remainingFraction: fraction,
+          percentage: Math.round(pctVal),
+          resetTime,
+          window
+        };
+        assign(window === "FIVE_HOURS" ? "gemini5h" : "geminiWeekly", b);
+        found++;
+      }
+    }
+
+    return found > 0 ? snapshot : null;
+  }
+
+  /**
+   * Probes local Antigravity Language Server (legacy method for Antigravity < 2.34)
    */
   private async probeLocalLanguageServer(manualPort?: string | number): Promise<AntigravityQuotaSnapshot | null> {
     // Fast path: reuse the last endpoint that worked
@@ -174,8 +446,16 @@ export class QuotaService {
 
     const processes = await this.detectLocalProcesses();
     this.diag(`Found ${processes.length} candidate Antigravity process(es)`);
+    let sawHardened234 = false;
     for (const p of processes) {
-      this.diag(`  pid=${p.pid} name=${p.name} csrf=${QuotaService.redact(p.csrfToken)} extCsrf=${QuotaService.redact(p.extensionCsrfToken)} argPorts=[${p.argPorts.join(",")}]`);
+      if (p.usesStdinBridgeToken && !p.csrfToken && !p.extensionCsrfToken) {
+        sawHardened234 = true;
+      }
+      this.diag(`  pid=${p.pid} name=${p.name} csrf=${QuotaService.redact(p.csrfToken)} extCsrf=${QuotaService.redact(p.extensionCsrfToken)} stdinToken=${p.usesStdinBridgeToken} argPorts=[${p.argPorts.join(",")}]`);
+    }
+
+    if (sawHardened234 && !manualPort) {
+      this.diag("Detected Antigravity v2.34+ (--read_host_bridge_token_from_stdin with no --csrf_token). Local RPC is locked down; use the official 'agy' CLI instead.");
     }
 
     const allTokens = Array.from(new Set(
@@ -197,9 +477,11 @@ export class QuotaService {
       if (!isNaN(p)) addTarget("127.0.0.1", p, allTokens);
     }
 
-    if (processes.length > 0) {
-      const listening = await this.listListeningPorts(processes.map((p) => p.pid));
-      for (const p of processes) {
+    // Only probe processes that actually have a token (or if manualPort was given)
+    const tokenedProcs = processes.filter((p) => p.csrfToken || p.extensionCsrfToken);
+    if (tokenedProcs.length > 0) {
+      const listening = await this.listListeningPorts(tokenedProcs.map((p) => p.pid));
+      for (const p of tokenedProcs) {
         const tokens = [p.csrfToken, p.extensionCsrfToken].filter(Boolean);
         for (const l of listening.filter((x) => x.pid === p.pid)) {
           addTarget(l.host, l.port, tokens);
@@ -210,7 +492,7 @@ export class QuotaService {
       }
     }
 
-    this.diag(`Probing ${targets.length} port(s): ${targets.map((t) => `${t.host}:${t.port}`).join(", ") || "(none)"}`);
+    this.diag(`Probing ${targets.length} local port(s): ${targets.map((t) => `${t.host}:${t.port}`).join(", ") || "(none)"}`);
     if (targets.length === 0) return null;
 
     for (const method of [SUMMARY_METHOD, STATUS_METHOD]) {
@@ -269,7 +551,7 @@ export class QuotaService {
     return headers;
   }
 
-  private parseBody(body: string, source: "local" | "cloud"): AntigravityQuotaSnapshot | null {
+  private parseBody(body: string, source: "cli" | "local" | "cloud"): AntigravityQuotaSnapshot | null {
     let json: unknown;
     try {
       json = JSON.parse(body);
@@ -339,7 +621,7 @@ export class QuotaService {
       if (process.platform === "win32") {
         const script =
           "Get-CimInstance Win32_Process | " +
-          "Where-Object { $_.Name -match 'language_server|^agy' -or ($_.CommandLine -match 'csrf_token' -and $_.CommandLine -match 'antigravity') } | " +
+          "Where-Object { $_.Name -match 'language_server|^agy' -or ($_.CommandLine -match 'csrf_token|read_host_bridge_token_from_stdin' -and $_.CommandLine -match 'antigravity') } | " +
           "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress";
         const { stdout } = await execFileAsync(
           "powershell.exe",
@@ -362,7 +644,7 @@ export class QuotaService {
           const args = m[2];
           const exe = args.split(/\s+/)[0] || "";
           const base = path.basename(exe);
-          if (/language_server/i.test(base) || /^agy\b/i.test(base) || (/csrf_token/.test(args) && /antigravity/i.test(args))) {
+          if (/language_server/i.test(base) || /^agy\b/i.test(base) || (/(csrf_token|read_host_bridge_token_from_stdin)/.test(args) && /antigravity/i.test(args))) {
             raw.push({ pid: Number(m[1]), name: base, commandLine: args });
           }
         }
@@ -393,7 +675,8 @@ export class QuotaService {
         commandLine: r.commandLine,
         csrfToken: get("csrf_token"),
         extensionCsrfToken: get("extension_server_csrf_token"),
-        argPorts
+        argPorts,
+        usesStdinBridgeToken: /--?read_host_bridge_token_from_stdin\b/.test(r.commandLine)
       });
     }
     return result;
@@ -461,13 +744,17 @@ export class QuotaService {
   }
 
   /**
-   * Calls Google Cloud Code PA endpoint using OAuth access token
+   * Calls Google Cloud Code PA endpoint using OAuth access token.
+   * Merges responses across hosts so partial responses (e.g. Claude-only from daily)
+   * still pick up Gemini pools from production.
    */
   private async fetchFromCloudCode(token: string): Promise<AntigravityQuotaSnapshot | null> {
     const hosts = [
       "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
       "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
     ];
+
+    let merged: AntigravityQuotaSnapshot | null = null;
 
     for (const url of hosts) {
       try {
@@ -479,7 +766,7 @@ export class QuotaService {
           headers: {
             "Authorization": `Bearer ${token}`,
             "Content-Type": "application/json",
-            "User-Agent": "antigravity/hub/2.24.0"
+            "User-Agent": "antigravity/hub/2.34.0"
           },
           body: JSON.stringify({}),
           signal: controller.signal
@@ -490,12 +777,25 @@ export class QuotaService {
         if (!resp.ok) continue;
 
         const snap = this.parseBody(await resp.text(), "cloud");
-        if (snap) return snap;
+        if (snap) {
+          if (!merged) {
+            merged = snap;
+          } else {
+            merged.gemini5h ??= snap.gemini5h;
+            merged.geminiWeekly ??= snap.geminiWeekly;
+            merged.claude5h ??= snap.claude5h;
+            merged.claudeWeekly ??= snap.claudeWeekly;
+            merged.geminiArgonWeekly ??= snap.geminiArgonWeekly;
+            merged.accountEmail ??= snap.accountEmail;
+            merged.planName ??= snap.planName;
+          }
+          if (merged.gemini5h && merged.geminiWeekly) return merged;
+        }
       } catch (err: any) {
         this.diag(`Cloud ${url} failed: ${String(err?.message || err)}`);
       }
     }
-    return null;
+    return merged;
   }
 
   /**
@@ -535,7 +835,7 @@ export class QuotaService {
    * `userStatus`, ...) and both bucket-style and per-model `quotaInfo` layouts.
    * Returns null when no quota information is present.
    */
-  public parseQuotaResponse(data: any, source: "local" | "cloud"): AntigravityQuotaSnapshot | null {
+  public parseQuotaResponse(data: any, source: "cli" | "local" | "cloud"): AntigravityQuotaSnapshot | null {
     if (!data || typeof data !== "object") return null;
 
     const snapshot: AntigravityQuotaSnapshot = {
